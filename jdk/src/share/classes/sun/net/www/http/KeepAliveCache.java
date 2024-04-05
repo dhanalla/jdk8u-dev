@@ -112,14 +112,7 @@ public class KeepAliveCache
      * @param url  The URL contains info about the host and port
      * @param http The HttpClient to be cached
      */
-    public void put(final URL url, Object obj, HttpClient http) {
-        // this method may need to close an HttpClient, either because
-        // it is not cacheable, or because the cache is at its capacity.
-        // In the latter case, we close the least recently used client.
-        // The client to close is stored in oldClient, and is closed
-        // after cacheLock is released.
-        HttpClient oldClient = null;
-        synchronized (this) {
+    public synchronized void put(final URL url, Object obj, HttpClient http) {
             boolean startThread = (keepAliveTimer == null);
             if (!startThread) {
                 if (!keepAliveTimer.isAlive()) {
@@ -181,20 +174,15 @@ public class KeepAliveCache
                 // alive, which could be 0, if the user specified 0 for the property
                 assert keepAliveTimeout >= 0;
                 if (keepAliveTimeout == 0) {
-                    oldClient = http;
+                    http.closeServer();
                 } else {
                     v = new ClientVector(keepAliveTimeout * 1000);
                     v.put(http);
                     super.put(key, v);
                 }
         } else {
-                oldClient = v.put(http);
-        }
+            v.put(http);
     }
-        // close after releasing locks
-        if (oldClient != null) {
-            oldClient.closeServer();
-        }
     }
 
     // returns the keep alive set by user in system property or -1 if not set
@@ -244,7 +232,6 @@ public class KeepAliveCache
             try {
                 Thread.sleep(LIFETIME);
             } catch (InterruptedException e) {}
-            List<HttpClient> closeList = null;
 
             // Remove all outdated HttpClients.
             synchronized (this) {
@@ -254,18 +241,15 @@ public class KeepAliveCache
                 for (KeepAliveKey key : keySet()) {
                     ClientVector v = get(key);
                     synchronized (v) {
-                        KeepAliveEntry e = v.peekLast();
+                        KeepAliveEntry e = v.peek();
                         while (e != null) {
                             if ((currentTime - e.idleStartTime) > v.nap) {
-                                v.pollLast();
-                                if (closeList == null) {
-                                    closeList = new ArrayList<>();
-                                }
-                                closeList.add(e.hc);
+                                v.poll();
+                                e.hc.closeServer();
                             } else {
                                 break;
                             }
-                            e = v.peekLast();
+                            e = v.peek();
                         }
 
                         if (v.isEmpty()) {
@@ -276,12 +260,6 @@ public class KeepAliveCache
 
                 for (KeepAliveKey key : keysToRemove) {
                     removeVector(key);
-                }
-            }
-            // close connections outside cacheLock
-            if (closeList != null) {
-                for (HttpClient hc : closeList) {
-                    hc.closeServer();
                 }
             }
         } while (!isEmpty());
@@ -301,8 +279,8 @@ public class KeepAliveCache
     }
 }
 
-/* LIFO order for reusing HttpClients. Most recent entries at the front.
- * If > maxConns are in use, discard oldest.
+/* FILO order for recycling HttpClients, should run in a thread
+ * to time them out.  If > maxConns are in use, block.
  */
 class ClientVector extends ArrayDeque<KeepAliveEntry> {
     private static final long serialVersionUID = -8680532108106489459L;
@@ -315,37 +293,36 @@ class ClientVector extends ArrayDeque<KeepAliveEntry> {
     }
 
     synchronized HttpClient get() {
-        // check the most recent connection, use if still valid
-        KeepAliveEntry e = peekFirst();
-        if (e == null) {
+        if (isEmpty()) {
             return null;
         }
 
+        // Loop until we find a connection that has not timed out
+        HttpClient hc = null;
         long currentTime = System.currentTimeMillis();
-        if ((currentTime - e.idleStartTime) > nap) {
-            return null; // all connections stale - will be cleaned up later
-        } else {
-            pollFirst();
+        do {
+            KeepAliveEntry e = pop();
+            if ((currentTime - e.idleStartTime) > nap) {
+                e.hc.closeServer();
+            } else {
+                hc = e.hc;
                 if (KeepAliveCache.logger.isLoggable(PlatformLogger.Level.FINEST)) {
                     String msg = "cached HttpClient was idle for "
                         + Long.toString(currentTime - e.idleStartTime);
                     KeepAliveCache.logger.finest(msg);
                 }
-            return e.hc;
             }
+        } while ((hc == null) && (!isEmpty()));
+        return hc;
     }
 
     /* return a still valid, unused HttpClient */
-    synchronized HttpClient put(HttpClient h) {
-        HttpClient staleClient = null;
-        assert KeepAliveCache.getMaxConnections() > 0;
+    synchronized void put(HttpClient h) {
         if (size() >= KeepAliveCache.getMaxConnections()) {
-            // remove oldest connection
-            staleClient = removeLast().hc;
+            h.closeServer(); // otherwise the connection remains in limbo
+        } else {
+            push(new KeepAliveEntry(h, System.currentTimeMillis()));
         }
-        addFirst(new KeepAliveEntry(h, System.currentTimeMillis()));
-        // close after releasing the locks
-        return staleClient;
     }
 
     /* remove an HttpClient */
@@ -373,10 +350,10 @@ class ClientVector extends ArrayDeque<KeepAliveEntry> {
 }
 
 class KeepAliveKey {
-    private final String      protocol;
-    private final String      host;
-    private final int         port;
-    private final Object      obj; // additional key, such as socketfactory
+    private String      protocol = null;
+    private String      host = null;
+    private int         port = 0;
+    private Object      obj = null; // additional key, such as socketfactory
 
     /**
      * Constructor
@@ -417,8 +394,8 @@ class KeepAliveKey {
 }
 
 class KeepAliveEntry {
-    final HttpClient hc;
-    final long idleStartTime;
+    HttpClient hc;
+    long idleStartTime;
 
     KeepAliveEntry(HttpClient hc, long idleStartTime) {
         this.hc = hc;
